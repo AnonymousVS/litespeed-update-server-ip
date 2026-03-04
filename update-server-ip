@@ -125,21 +125,21 @@ run_site() {
     _mark() { touch "${result_dir}/${1}_$$_${idx}"; }
 
     # --- ตรวจ Plugin ติดตั้งหรือไม่ ---
-    if ! wp --path="$dir" plugin is-installed litespeed-cache --allow-root 2>/dev/null; then
+    if ! wp --path="$dir" plugin is-installed litespeed-cache --allow-root >/dev/null 2>&1; then
         _log "${pfx} ${Y}⏭  SKIP${N}  ${D}ไม่มี Plugin${N}  ${C}${site}${N}"
         _mark "skip"; return
     fi
 
     # --- ตรวจ Plugin เปิดอยู่ไหม ---
-    if ! wp --path="$dir" plugin is-active litespeed-cache --allow-root 2>/dev/null; then
+    if ! wp --path="$dir" plugin is-active litespeed-cache --allow-root >/dev/null 2>&1; then
         _log "${pfx} ${Y}⏭  SKIP${N}  ${D}Plugin ถูกปิด${N}  ${C}${site}${N}"
         _mark "skip"; return
     fi
 
     # --- อ่านค่า IP ปัจจุบัน ---
     local old_ip
-    old_ip=$(wp --path="$dir" litespeed-option get server_ip \
-        --allow-root 2>/dev/null | tr -d '[:space:]')
+    old_ip=$(wp --path="$dir" litespeed-option get server_ip --format=value \
+        --allow-root 2>/dev/null | grep -E "^[0-9]+.[0-9]+.[0-9]+.[0-9]+$" | head -1 | tr -d '[:space:]')
 
     # --- IP เหมือนเดิม → ข้าม ---
     if [[ "$old_ip" == "$srv_ip" ]]; then
@@ -149,12 +149,12 @@ run_site() {
 
     # --- อัพเดต IP ---
     if wp --path="$dir" litespeed-option set server_ip "$srv_ip" \
-            --allow-root 2>/dev/null; then
+            --allow-root >/dev/null 2>&1; then
 
         # ยืนยันค่าที่เขียน
         local new_ip
-        new_ip=$(wp --path="$dir" litespeed-option get server_ip \
-            --allow-root 2>/dev/null | tr -d '[:space:]')
+        new_ip=$(wp --path="$dir" litespeed-option get server_ip --format=value \
+            --allow-root 2>/dev/null | grep -E "^[0-9]+.[0-9]+.[0-9]+.[0-9]+$" | head -1 | tr -d '[:space:]')
 
         if [[ "$new_ip" == "$srv_ip" ]]; then
             local old_show="${old_ip:-ว่าง}"
