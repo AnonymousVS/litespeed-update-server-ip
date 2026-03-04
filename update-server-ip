@@ -4,9 +4,8 @@
 # Config
 # ====================================
 LOG_FILE="/var/log/lscwp-update-ip.log"
-LOCK_FILE="${LOG_FILE}.lock"
+LOG_LOCK="/tmp/lscwp-log-$$.lock"
 RESULT_DIR="/tmp/lscwp-results-$$"
-COUNTER_FILE="/tmp/lscwp-counter-$$"
 RAM_PER_JOB_MB=200
 
 # ====================================
@@ -21,34 +20,28 @@ DIM='\033[2m'
 NC='\033[0m'
 
 # ====================================
-# Log function (Main Process)
+# Log function
 # ====================================
 log() {
-    local DATE=$(date '+%Y-%m-%d %H:%M:%S')
     echo -e "$1"
-    local CLEAN=$(echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g')
-    ( flock 200; echo "[$DATE] $CLEAN" >> "$LOG_FILE" ) 200>"$LOCK_FILE"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$(echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g')" \
+        | flock "$LOG_LOCK" tee -a "$LOG_FILE" >/dev/null
 }
 
 # ====================================
-# Cleanup เมื่อ Script จบ
+# Cleanup
 # ====================================
 cleanup() {
     rm -rf "$RESULT_DIR"
-    rm -f "$LOCK_FILE"
-    rm -f "$COUNTER_FILE"
-    rm -f "${COUNTER_FILE}.lock"
+    rm -f  "$LOG_LOCK"
 }
 trap cleanup EXIT
 
-# ====================================
-# สร้าง Temp Dir เก็บผลลัพธ์
-# ====================================
 mkdir -p "$RESULT_DIR"
-echo "0" > "$COUNTER_FILE"
 
 # ====================================
-# คำนวณ MAX_JOBS อัตโนมัติ
+# คำนวณ MAX_JOBS
 # ====================================
 CPU_CORES=$(nproc)
 TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
@@ -59,59 +52,64 @@ if [ "$CPU_CORES" -lt "$MAX_JOBS_BY_RAM" ]; then
 else
     MAX_JOBS=$MAX_JOBS_BY_RAM
 fi
-
-[ "$MAX_JOBS" -lt 1 ] && MAX_JOBS=1
+[ "$MAX_JOBS" -lt 1 ]  && MAX_JOBS=1
 [ "$MAX_JOBS" -gt 20 ] && MAX_JOBS=20
 
 # ====================================
-# ดึง Server IP (ครั้งเดียว แล้วเก็บไว้ใช้ทั้งหมด)
+# Header
 # ====================================
+log ""
 log "${BOLD}======================================${NC}"
-log "${BOLD} LITESPEED UPDATE SERVER IP${NC}"
+log "${BOLD}  LITESPEED UPDATE SERVER IP${NC}"
 log "${BOLD}======================================${NC}"
-log " CPU Cores     : ${CYAN}${CPU_CORES} Core${NC}"
-log " Total RAM     : ${CYAN}${TOTAL_RAM_MB} MB${NC}"
-log " RAM/Job       : ${CYAN}${RAM_PER_JOB_MB} MB${NC}"
-log " Auto MAX_JOBS : ${CYAN}${MAX_JOBS}${NC}"
-
+log " ${DIM}CPU Cores  :${NC} ${CYAN}${CPU_CORES} Core${NC}"
+log " ${DIM}Total RAM  :${NC} ${CYAN}${TOTAL_RAM_MB} MB${NC}"
+log " ${DIM}Max Jobs   :${NC} ${CYAN}${MAX_JOBS}${NC}"
 log "${DIM}--------------------------------------${NC}"
+
+# ====================================
+# ดึง Server IP — fallback 3 แหล่ง, เก็บค่าครั้งเดียว
+# ====================================
 log " กำลังดึง Server IP..."
 
 SERVER_IP=""
-for SOURCE in "https://ifconfig.me" "https://ipinfo.io/ip" "https://api.ipify.org"; do
-    SERVER_IP=$(curl -s --max-time 10 "$SOURCE" 2>/dev/null | tr -d '[:space:]')
-    if [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+for SOURCE in "https://ifconfig.me" "https://api.ipify.org" "https://ipinfo.io/ip"; do
+    IP=$(curl -4 -s --max-time 10 "$SOURCE" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        SERVER_IP="$IP"
         break
     fi
-    SERVER_IP=""
 done
 
 if [ -z "$SERVER_IP" ]; then
-    log "${RED}❌ ERROR: ไม่สามารถดึง Server IP ได้ หยุดการทำงาน${NC}"
+    log "${RED}❌ ERROR: ดึง Server IP ไม่ได้ — หยุดทำงาน${NC}"
     exit 1
 fi
 
-log " Server IP     : ${BOLD}${GREEN}${SERVER_IP}${NC}  ${DIM}(เก็บค่าแล้ว ใช้ตลอด)${NC}"
+log " ${DIM}Server IP  :${NC} ${BOLD}${GREEN}${SERVER_IP}${NC}  ${DIM}← เก็บค่าแล้ว ใช้กับทุกเว็บ${NC}"
 log "${BOLD}======================================${NC}"
 
 # ====================================
-# ฟังก์ชันจัดการแต่ละเว็บ (Subprocess)
+# ฟังก์ชัน parse IP จาก output ของ wp litespeed-option get
+# output มีหน้าตา: "server_ip:\n15.235.140.227"
+# ต้อง grep เอา IP จริงๆ ออกมา
+# ====================================
+parse_ip() {
+    grep -E "^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$" | head -1 | tr -d '[:space:]'
+}
+
+# ====================================
+# Worker — รันใน subprocess
 # ====================================
 process_site() {
     local dir="$1"
     local SERVER_IP="$2"
     local LOG_FILE="$3"
-    local LOCK_FILE="$4"
+    local LOG_LOCK="$4"
     local RESULT_DIR="$5"
-    local TOTAL="$6"
-    local COUNTER_FILE="$7"
+    local IDX="$6"
+    local TOTAL="$7"
 
-    # แก้ไข: path /home/username/public_html/domain/ → field 3 = username, field 5 = domain
-    local SITE
-    SITE=$(echo "$dir" | awk -F'/' '{print $3"/"$5}')
-    local UNIQUE="${BASHPID}_$(date +%s%N)"
-
-    # Colors (ใช้ใน subprocess)
     local RED='\033[0;31m'
     local GREEN='\033[0;32m'
     local YELLOW='\033[1;33m'
@@ -120,67 +118,70 @@ process_site() {
     local DIM='\033[2m'
     local NC='\033[0m'
 
+    # ชื่อเว็บ: /home/USER/public_html/DOMAIN/ → USER/DOMAIN
+    local SITE
+    SITE=$(awk -F'/' '{print $3"/"$5}' <<< "$dir")
+    local UNIQUE="${IDX}_${BASHPID}"
+    local PFX="${DIM}[${IDX}/${TOTAL}]${NC}"
+
     _log() {
-        local DATE=$(date '+%Y-%m-%d %H:%M:%S')
         echo -e "$1"
-        local CLEAN=$(echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g')
-        ( flock 200; echo "[$DATE] $CLEAN" >> "$LOG_FILE" ) 200>"$LOCK_FILE"
+        printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+            "$(echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g')" \
+            | flock "$LOG_LOCK" tee -a "$LOG_FILE" >/dev/null
     }
 
-    # นับ counter (thread-safe)
-    local NUM
-    NUM=$(
-        flock 201
-        N=$(cat "$COUNTER_FILE")
-        N=$(( N + 1 ))
-        echo "$N" > "$COUNTER_FILE"
-        echo "$N"
-    ) 201>"${COUNTER_FILE}.lock"
+    _mark() { touch "${RESULT_DIR}/${1}_${UNIQUE}"; }
 
-    local PREFIX="${DIM}[${NUM}/${TOTAL}]${NC}"
+    parse_ip() {
+        grep -E "^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$" | head -1 | tr -d '[:space:]'
+    }
 
-    # ตรวจสอบว่าติดตั้ง LiteSpeed Cache ไหม
-    if ! wp --path="$dir" plugin is-installed litespeed-cache --allow-root 2>/dev/null; then
-        _log "${PREFIX} ${YELLOW}⏭  SKIP${NC}  ${DIM}(ไม่มี Plugin)${NC}  ${CYAN}${SITE}${NC}"
-        touch "${RESULT_DIR}/skipped_${UNIQUE}"
-        return
+    # --- ตรวจ Plugin ติดตั้งหรือไม่ ---
+    if ! wp --path="$dir" plugin is-installed litespeed-cache \
+            --allow-root >/dev/null 2>&1; then
+        _log "${PFX} ${YELLOW}⏭  SKIP${NC}  ${DIM}ไม่มี Plugin${NC}  ${CYAN}${SITE}${NC}"
+        _mark "skip"; return
     fi
 
-    # ตรวจสอบว่า Active ไหม
-    if ! wp --path="$dir" plugin is-active litespeed-cache --allow-root 2>/dev/null; then
-        _log "${PREFIX} ${YELLOW}⏭  SKIP${NC}  ${DIM}(Plugin ปิดอยู่)${NC}  ${CYAN}${SITE}${NC}"
-        touch "${RESULT_DIR}/skipped_${UNIQUE}"
-        return
+    # --- ตรวจ Plugin เปิดอยู่ไหม ---
+    if ! wp --path="$dir" plugin is-active litespeed-cache \
+            --allow-root >/dev/null 2>&1; then
+        _log "${PFX} ${YELLOW}⏭  SKIP${NC}  ${DIM}Plugin ถูกปิด${NC}  ${CYAN}${SITE}${NC}"
+        _mark "skip"; return
     fi
 
-    # แก้ไข: ใช้ wp litespeed-option get แทน wp option get litespeed.conf.server_ip
+    # --- อ่าน IP ปัจจุบัน ---
     local OLD_IP
-    OLD_IP=$(wp --path="$dir" litespeed-option get server_ip --allow-root 2>/dev/null | tr -d '[:space:]')
+    OLD_IP=$(wp --path="$dir" litespeed-option get server_ip \
+        --allow-root 2>/dev/null | parse_ip)
 
-    # ⭐ ข้าม: IP เหมือนเดิมแล้ว ไม่ต้องทำอะไร
+    # --- IP เหมือนเดิม → ข้ามทันที ---
     if [ "$OLD_IP" = "$SERVER_IP" ]; then
-        _log "${PREFIX} ${DIM}⏩  SAME   (IP ตรงกันแล้ว)${NC}  ${CYAN}${SITE}${NC}  ${DIM}→ ${OLD_IP}${NC}"
-        touch "${RESULT_DIR}/same_${UNIQUE}"
-        return
+        _log "${PFX} ${DIM}⏩  SAME   IP ตรงกันแล้ว ข้าม${NC}  ${CYAN}${SITE}${NC}  ${DIM}(${OLD_IP})${NC}"
+        _mark "same"; return
     fi
 
-    # อัพเดต IP
-    if wp --path="$dir" litespeed-option set server_ip "$SERVER_IP" --allow-root 2>/dev/null; then
-        # ตรวจสอบค่าที่บันทึกจริง
+    # --- อัพเดต IP ---
+    if wp --path="$dir" litespeed-option set server_ip "$SERVER_IP" \
+            --allow-root >/dev/null 2>&1; then
+
+        # ยืนยันค่าที่เขียนจริง
         local NEW_IP
-        NEW_IP=$(wp --path="$dir" litespeed-option get server_ip --allow-root 2>/dev/null | tr -d '[:space:]')
+        NEW_IP=$(wp --path="$dir" litespeed-option get server_ip \
+            --allow-root 2>/dev/null | parse_ip)
 
         if [ "$NEW_IP" = "$SERVER_IP" ]; then
-            local OLD_DISPLAY="${OLD_IP:-ว่าง}"
-            _log "${PREFIX} ${GREEN}✅ OK${NC}     ${CYAN}${SITE}${NC}  ${DIM}${OLD_DISPLAY} → ${NC}${GREEN}${NEW_IP}${NC}"
-            touch "${RESULT_DIR}/success_${UNIQUE}"
+            local OLD_D="${OLD_IP:-ว่าง}"
+            _log "${PFX} ${GREEN}✅ OK${NC}     ${CYAN}${SITE}${NC}  ${DIM}${OLD_D} →${NC} ${GREEN}${NEW_IP}${NC}"
+            _mark "success"
         else
-            _log "${PREFIX} ${RED}❌ VERIFY${NC}  ${CYAN}${SITE}${NC}  ${DIM}(ค่าที่ได้ = ${NEW_IP:-ว่าง})${NC}"
-            touch "${RESULT_DIR}/failed_${UNIQUE}"
+            _log "${PFX} ${RED}❌ VERIFY${NC}  ${CYAN}${SITE}${NC}  ${DIM}(ได้ = ${NEW_IP:-ว่าง})${NC}"
+            _mark "failed"
         fi
     else
-        _log "${PREFIX} ${RED}❌ FAILED${NC}  ${CYAN}${SITE}${NC}"
-        touch "${RESULT_DIR}/failed_${UNIQUE}"
+        _log "${PFX} ${RED}❌ FAILED${NC}  ${CYAN}${SITE}${NC}"
+        _mark "failed"
     fi
 }
 
@@ -189,31 +190,33 @@ export -f process_site
 # ====================================
 # หา WordPress ทั้งหมด
 # ====================================
+log " กำลังค้นหา WordPress..."
+
 DIRS=()
 for dir in /home/*/public_html/*/; do
-    if [ -f "${dir}wp-config.php" ]; then
-        DIRS+=("$dir")
-    fi
+    [ -f "${dir}wp-config.php" ] && DIRS+=("$dir")
 done
 
 TOTAL=${#DIRS[@]}
 
 if [ "$TOTAL" -eq 0 ]; then
-    log "${RED}❌ ไม่พบ WordPress ใดๆ ใน /home/*/public_html/*/wp-config.php${NC}"
+    log "${RED}❌ ไม่พบ WordPress ใดๆ${NC}"
     exit 1
 fi
 
-log " พบ WordPress : ${BOLD}${TOTAL} เว็บ${NC}"
-log " Server IP    : ${GREEN}${SERVER_IP}${NC}  ${DIM}(ใช้ค่านี้ทั้งหมด)${NC}"
+log " ${DIM}พบ WordPress :${NC} ${BOLD}${TOTAL} เว็บ${NC}"
 log "${BOLD}======================================${NC}"
 
 # ====================================
 # Parallel Sliding Window
 # ====================================
 declare -a PIDS=()
+IDX=0
 
 for dir in "${DIRS[@]}"; do
-    process_site "$dir" "$SERVER_IP" "$LOG_FILE" "$LOCK_FILE" "$RESULT_DIR" "$TOTAL" "$COUNTER_FILE" &
+    (( IDX++ ))
+    process_site "$dir" "$SERVER_IP" "$LOG_FILE" "$LOG_LOCK" \
+                 "$RESULT_DIR" "$IDX" "$TOTAL" &
     PIDS+=($!)
 
     if [ "${#PIDS[@]}" -ge "$MAX_JOBS" ]; then
@@ -222,28 +225,28 @@ for dir in "${DIRS[@]}"; do
     fi
 done
 
-# รอทุก Job เสร็จ
 for pid in "${PIDS[@]}"; do
     wait "$pid"
 done
 
 # ====================================
-# นับผลจาก Temp Files
+# สรุปผล
 # ====================================
-SUCCESS=$(find "$RESULT_DIR" -name "success_*" 2>/dev/null | wc -l)
-SKIPPED=$(find "$RESULT_DIR" -name "skipped_*" 2>/dev/null | wc -l)
-SAME=$(find    "$RESULT_DIR" -name "same_*"    2>/dev/null | wc -l)
-FAILED=$(find  "$RESULT_DIR" -name "failed_*"  2>/dev/null | wc -l)
-CHANGED=$(( SUCCESS + FAILED ))
+CNT_OK=$(find   "$RESULT_DIR" -name "success_*" 2>/dev/null | wc -l)
+CNT_SAME=$(find "$RESULT_DIR" -name "same_*"    2>/dev/null | wc -l)
+CNT_SKIP=$(find "$RESULT_DIR" -name "skip_*"    2>/dev/null | wc -l)
+CNT_FAIL=$(find "$RESULT_DIR" -name "failed_*"  2>/dev/null | wc -l)
 
+log ""
 log "${BOLD}======================================${NC}"
-log "${BOLD} สรุปผล${NC}"
+log "${BOLD}  สรุปผล${NC}"
 log "${BOLD}--------------------------------------${NC}"
-log " ${GREEN}✅ อัพเดตสำเร็จ${NC}     : ${BOLD}${SUCCESS}${NC} เว็บ"
-log " ${DIM}⏩  IP เดิม (ข้าม)${NC}  : ${SAME} เว็บ"
-log " ${YELLOW}⏭  ข้าม (ไม่มี/ปิด)${NC}: ${SKIPPED} เว็บ"
-log " ${RED}❌ ล้มเหลว${NC}          : ${BOLD}${FAILED}${NC} เว็บ"
+log " ${GREEN}✅ อัพเดตสำเร็จ${NC}       : ${BOLD}${CNT_OK}${NC} เว็บ"
+log " ${DIM}⏩  IP เดิม (ข้าม)${NC}    : ${CNT_SAME} เว็บ"
+log " ${YELLOW}⏭  ข้าม (ไม่มี/ปิด)${NC}  : ${CNT_SKIP} เว็บ"
+log " ${RED}❌ ล้มเหลว${NC}             : ${BOLD}${CNT_FAIL}${NC} เว็บ"
 log "${BOLD}--------------------------------------${NC}"
-log " รวมทั้งหมด          : ${TOTAL} เว็บ"
-log " Log อยู่ที่          : ${DIM}${LOG_FILE}${NC}"
+log " รวมทั้งหมด             : ${TOTAL} เว็บ"
+log " Log อยู่ที่             : ${DIM}${LOG_FILE}${NC}"
 log "${BOLD}======================================${NC}"
+log ""
