@@ -139,7 +139,7 @@ run_site() {
     # --- อ่านค่า IP ปัจจุบัน ---
     local old_ip
     old_ip=$(wp --path="$dir" litespeed-option get server_ip --format=value \
-        --allow-root 2>/dev/null | grep -E "^[0-9]+.[0-9]+.[0-9]+.[0-9]+$" | head -1 | tr -d '[:space:]')
+        --allow-root 2>/dev/null | grep -E "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$" | head -1 | tr -d '[:space:]')
 
     # --- IP เหมือนเดิม → ข้าม ---
     if [[ "$old_ip" == "$srv_ip" ]]; then
@@ -154,7 +154,7 @@ run_site() {
         # ยืนยันค่าที่เขียน
         local new_ip
         new_ip=$(wp --path="$dir" litespeed-option get server_ip --format=value \
-            --allow-root 2>/dev/null | grep -E "^[0-9]+.[0-9]+.[0-9]+.[0-9]+$" | head -1 | tr -d '[:space:]')
+            --allow-root 2>/dev/null | grep -E "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$" | head -1 | tr -d '[:space:]')
 
         if [[ "$new_ip" == "$srv_ip" ]]; then
             local old_show="${old_ip:-ว่าง}"
