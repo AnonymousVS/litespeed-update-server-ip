@@ -1,0 +1,183 @@
+#!/bin/bash
+
+# ====================================
+# Config
+# ====================================
+LOG_FILE="/var/log/lscwp-update-ip.log"
+LOCK_FILE="${LOG_FILE}.lock"
+RESULT_DIR="/tmp/lscwp-results-$$"
+RAM_PER_JOB_MB=200
+
+# ====================================
+# Log function (Main Process)
+# ====================================
+log() {
+    local DATE=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "$1"
+    ( flock 200; echo "[$DATE] $1" >> "$LOG_FILE" ) 200>"$LOCK_FILE"
+}
+
+# ====================================
+# Cleanup เมื่อ Script จบ
+# ====================================
+cleanup() {
+    rm -rf "$RESULT_DIR"
+    rm -f "$LOCK_FILE"
+}
+trap cleanup EXIT
+
+# ====================================
+# สร้าง Temp Dir เก็บผลลัพธ์
+# ====================================
+mkdir -p "$RESULT_DIR"
+
+# ====================================
+# คำนวณ MAX_JOBS อัตโนมัติ
+# ====================================
+CPU_CORES=$(nproc)
+TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+MAX_JOBS_BY_RAM=$(( TOTAL_RAM_MB / RAM_PER_JOB_MB ))
+
+if [ "$CPU_CORES" -lt "$MAX_JOBS_BY_RAM" ]; then
+    MAX_JOBS=$CPU_CORES
+else
+    MAX_JOBS=$MAX_JOBS_BY_RAM
+fi
+
+[ "$MAX_JOBS" -lt 1 ] && MAX_JOBS=1
+[ "$MAX_JOBS" -gt 20 ] && MAX_JOBS=20
+
+log "======================================"
+log " LITESPEED UPDATE SERVER IP"
+log "======================================"
+log " CPU Cores     : $CPU_CORES Core"
+log " Total RAM     : $TOTAL_RAM_MB MB"
+log " RAM/Job       : $RAM_PER_JOB_MB MB"
+log " Auto MAX_JOBS : $MAX_JOBS"
+
+# ====================================
+# ดึง Server IP
+# ====================================
+SERVER_IP=$(curl -s --max-time 10 ifconfig.me)
+
+if [ -z "$SERVER_IP" ]; then
+    log "❌ ERROR: ไม่สามารถดึง Server IP ได้ หยุดการทำงาน"
+    exit 1
+fi
+
+log " Server IP     : $SERVER_IP"
+log "======================================"
+
+# ====================================
+# ฟังก์ชันจัดการแต่ละเว็บ (Subprocess)
+# ====================================
+process_site() {
+    local dir="$1"
+    local SERVER_IP="$2"
+    local LOG_FILE="$3"
+    local LOCK_FILE="$4"
+    local RESULT_DIR="$5"
+    local SITE=$(echo "$dir" | awk -F'/' '{print $5"/"$7}')
+    local UNIQUE="${BASHPID}_$(date +%s%N)"
+
+    _log() {
+        local DATE=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "$1"
+        ( flock 200; echo "[$DATE] $1" >> "$LOG_FILE" ) 200>"$LOCK_FILE"
+    }
+
+    if ! wp --path="$dir" plugin is-installed litespeed-cache --allow-root 2>/dev/null; then
+        _log "⏭  SKIPPED (No LiteSpeed): $SITE"
+        touch "${RESULT_DIR}/skipped_${UNIQUE}"
+        return
+    fi
+
+    if ! wp --path="$dir" plugin is-active litespeed-cache --allow-root 2>/dev/null; then
+        _log "⏭  SKIPPED (Plugin Inactive): $SITE"
+        touch "${RESULT_DIR}/skipped_${UNIQUE}"
+        return
+    fi
+
+    local OLD_IP
+    OLD_IP=$(wp --path="$dir" option get litespeed.conf.server_ip --allow-root 2>/dev/null)
+    _log "   [$SITE] IP เดิม = ${OLD_IP:-ว่าง}"
+
+    if wp --path="$dir" litespeed-option set server_ip "$SERVER_IP" --allow-root 2>/dev/null; then
+        local NEW_IP
+        NEW_IP=$(wp --path="$dir" option get litespeed.conf.server_ip --allow-root 2>/dev/null)
+
+        if [ "$NEW_IP" = "$SERVER_IP" ]; then
+            _log "✅ SUCCESS: $SITE → $NEW_IP"
+            touch "${RESULT_DIR}/success_${UNIQUE}"
+        else
+            _log "❌ VERIFY FAILED: $SITE (ค่าที่ได้ = ${NEW_IP:-ว่าง})"
+            touch "${RESULT_DIR}/failed_${UNIQUE}"
+        fi
+    else
+        _log "❌ FAILED: $SITE"
+        touch "${RESULT_DIR}/failed_${UNIQUE}"
+    fi
+}
+
+export -f process_site
+
+# ====================================
+# หา WordPress ทั้งหมด
+# ====================================
+DIRS=()
+for dir in /home/*/public_html/*/; do
+    if [ -f "${dir}wp-config.php" ]; then
+        DIRS+=("$dir")
+    fi
+done
+
+TOTAL=${#DIRS[@]}
+log "พบ WordPress ทั้งหมด: $TOTAL เว็บ"
+log "======================================"
+
+# ====================================
+# Parallel Sliding Window
+# ====================================
+declare -a PIDS=()
+
+for dir in "${DIRS[@]}"; do
+    process_site "$dir" "$SERVER_IP" "$LOG_FILE" "$LOCK_FILE" "$RESULT_DIR" &
+    PIDS+=($!)
+
+    if [ "${#PIDS[@]}" -ge "$MAX_JOBS" ]; then
+        wait "${PIDS[0]}"
+        PIDS=("${PIDS[@]:1}")
+    fi
+done
+
+for pid in "${PIDS[@]}"; do
+    wait "$pid"
+done
+
+# ====================================
+# นับผลจาก Temp Files
+# ====================================
+SUCCESS=$(find "$RESULT_DIR" -name "success_*" 2>/dev/null | wc -l)
+SKIPPED=$(find "$RESULT_DIR" -name "skipped_*" 2>/dev/null | wc -l)
+FAILED=$(find "$RESULT_DIR" -name "failed_*" 2>/dev/null | wc -l)
+
+log "======================================"
+log " สรุปผล"
+log " ✅ Success : $SUCCESS เว็บ"
+log " ⏭  Skipped : $SKIPPED เว็บ"
+log " ❌ Failed  : $FAILED เว็บ"
+log " รวม       : $TOTAL เว็บ"
+log " Log อยู่ที่: $LOG_FILE"
+log "======================================"
+```
+
+5. เลื่อนลงล่าง → กด **Commit new file**
+
+---
+
+## STEP 4: เปิดไฟล์ดู Raw URL
+1. คลิกที่ไฟล์ `update-lscwp-ip.sh`
+2. กดปุ่ม **Raw** มุมขวาบน
+3. Copy URL ที่ได้ จะหน้าตาแบบนี้
+```
+https://raw.githubusercontent.com/ufavision/server-scripts/main/update-lscwp-ip.sh
