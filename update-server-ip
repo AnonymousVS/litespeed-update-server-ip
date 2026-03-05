@@ -68,6 +68,14 @@ log " ${DIM}Max Jobs   :${NC} ${CYAN}${MAX_JOBS}${NC}"
 log "${DIM}--------------------------------------${NC}"
 
 # ====================================
+# ตรวจ WP-CLI
+# ====================================
+if ! command -v wp &>/dev/null; then
+    log "${RED}❌ ERROR: ไม่พบ WP-CLI — https://wp-cli.org${NC}"
+    exit 1
+fi
+
+# ====================================
 # ดึง Server IP — fallback 3 แหล่ง, เก็บค่าครั้งเดียว
 # ====================================
 log " กำลังดึง Server IP..."
@@ -90,15 +98,6 @@ log " ${DIM}Server IP  :${NC} ${BOLD}${GREEN}${SERVER_IP}${NC}  ${DIM}← เก
 log "${BOLD}======================================${NC}"
 
 # ====================================
-# ฟังก์ชัน parse IP จาก output ของ wp litespeed-option get
-# output มีหน้าตา: "server_ip:\n15.235.140.227"
-# ต้อง grep เอา IP จริงๆ ออกมา
-# ====================================
-parse_ip() {
-    grep -E "^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$" | head -1 | tr -d '[:space:]'
-}
-
-# ====================================
 # Worker — รันใน subprocess
 # ====================================
 process_site() {
@@ -118,9 +117,9 @@ process_site() {
     local DIM='\033[2m'
     local NC='\033[0m'
 
-    # ชื่อเว็บ: /home/USER/public_html/DOMAIN/ → USER/DOMAIN
+    # ── ชื่อเว็บ: ตัด /home[N]/ หรือ /usr/home/ prefix ออก แล้วตัด trailing slash
     local SITE
-    SITE=$(awk -F'/' '{print $3"/"$5}' <<< "$dir")
+    SITE=$(echo "$dir" | sed -E 's|^/(usr/)?home[0-9]*/||;s|/$||')
     local UNIQUE="${IDX}_${BASHPID}"
     local PFX="${DIM}[${IDX}/${TOTAL}]${NC}"
 
@@ -188,13 +187,35 @@ process_site() {
 export -f process_site
 
 # ====================================
-# หา WordPress ทั้งหมด
+# ค้นหา WordPress ทุกเว็บ (ครบถ้วน)
+# — เหมือน cloudflare-zone-save-change.sh ที่เจอ 189 เว็บ
 # ====================================
 log " กำลังค้นหา WordPress..."
 
+declare -A _SEEN
 DIRS=()
-for dir in /home/*/public_html/*/; do
-    [ -f "${dir}wp-config.php" ] && DIRS+=("$dir")
+
+# ── แหล่งที่ 1: WHM /etc/trueuserdomains ─────────────────────
+if [[ -f /etc/trueuserdomains ]]; then
+    while IFS=' ' read -r _dom _usr _rest; do
+        _usr="${_usr%:}"
+        [[ -z "$_usr" ]] && continue
+        _uhome=$(getent passwd "$_usr" 2>/dev/null | cut -d: -f6)
+        [[ -d "$_uhome" ]] || continue
+        while IFS= read -r -d '' _wpc; do
+            _d="$(dirname "$_wpc")/"
+            [[ -z "${_SEEN[$_d]+_}" ]] && { _SEEN[$_d]=1; DIRS+=("$_d"); }
+        done < <(find "$_uhome" -maxdepth 5 -name "wp-config.php" -print0 2>/dev/null)
+    done < /etc/trueuserdomains
+fi
+
+# ── แหล่งที่ 2: Scan /home /home2 /home3 /home4 /home5 /usr/home ─
+for _base in /home /home2 /home3 /home4 /home5 /usr/home; do
+    [[ -d "$_base" ]] || continue
+    while IFS= read -r -d '' _wpc; do
+        _d="$(dirname "$_wpc")/"
+        [[ -z "${_SEEN[$_d]+_}" ]] && { _SEEN[$_d]=1; DIRS+=("$_d"); }
+    done < <(find "$_base" -maxdepth 5 -name "wp-config.php" -print0 2>/dev/null)
 done
 
 TOTAL=${#DIRS[@]}
