@@ -8,7 +8,7 @@
 ## วิธีรัน
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/litespeed-update-server-ip/main/update-server-ip)
+bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/Litespeed-Update-Server-IP/main/update-server-ip)
 ```
 
 ---
