@@ -2,15 +2,17 @@
 ###############################################################################
 # update-server-ip.sh
 # LiteSpeed Cache — Update Server IP across cPanel accounts
-# Version : 2.1.0
+# Version : 2.3.0
 # Location: /usr/local/sbin/update-server-ip.sh
 # Usage   : bash /usr/local/sbin/update-server-ip.sh
 # ─────────────────────────────────────────────────────────────────────────────
 # CHANGELOG:
-#   v2.1.0 | 2026-04-29 | ลบ getent passwd (cPanel user ไม่อยู่ใน /etc/passwd)
-#           |            | ลบ whmapi1 fallback (~0.5-2s/domain → ค้างนาน)
-#           |            | ใช้ /home/USER โดยตรง, path ไม่เจอ = SKIP ทันที
-#           |            | เพิ่ม spinner ขณะ SCAN
+#   v2.3.0 | 2026-04-29 | user list แสดงทันที (get_all_cpanel_users ก่อน build maps)
+#           |            | build maps ย้ายมาหลัง confirm พร้อม spinner
+#           |            | ไม่ต้องรอ 12,951 lines ก่อนเห็น cPanel list
+#   v2.2.0 | 2026-04-29 | build_parked_alias_map + build_addon_domains_map
+#           |            | เปลี่ยนจาก bash while loop → awk single pass
+#   v2.1.0 | 2026-04-29 | ลบ getent/whmapi1, เพิ่ม spinner
 #   v2.0.0 | 2026-04-29 | เพิ่ม Mode 1/2 menu เลือก cPanel
 #           |            | รองรับ 2 path structures
 #           |            | กรอง domain ครบ (trueuserdomains+userdatadomains)
@@ -18,7 +20,7 @@
 #   v1.0.0 | 2026-04-01 | Initial release
 ###############################################################################
 
-VERSION="2.1.0"
+VERSION="2.3.0"
 
 # ── Config ──────────────────────────────────────────────────────────────────
 RAM_PER_JOB_MB=200
@@ -99,12 +101,9 @@ print_header() {
 ###############################################################################
 build_main_domains_map() {
     G_MAIN_DOMAINS=(); G_USER_MAINDOMAIN=()
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" || "$line" == \#* ]] && continue
-        local domain cpuser
-        domain=$(awk '{print $1}' <<< "$line" | tr -d ':' | tr -d ' \t')
-        cpuser=$(awk '{print $2}' <<< "$line" | tr -d ' \t')
-        [[ -z "$domain" || -z "$cpuser" ]] && continue
+    while IFS=': ' read -r domain cpuser _; do
+        [[ -z "$domain" || "$domain" == \#* ]] && continue
+        [[ -z "$cpuser" ]] && continue
         G_MAIN_DOMAINS["$domain"]="$cpuser"
         G_USER_MAINDOMAIN["$cpuser"]="$domain"
     done < /etc/trueuserdomains
@@ -112,25 +111,36 @@ build_main_domains_map() {
 
 ###############################################################################
 # Build: Parked/Alias + Docroot Map (/etc/userdatadomains)
+# ใช้ awk single pass — bash while loop ช้ามากกับ 12,951+ lines
 ###############################################################################
 build_parked_alias_map() {
     G_DOMAIN_DOCROOT=(); G_PARKED_PARENT=()
     [[ ! -f /etc/userdatadomains ]] && return
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" || "$line" == \#* ]] && continue
-        local domain rest cpuser parent dtype docroot
-        domain=$(cut -d: -f1  <<< "$line" | tr -d ' \t')
-        rest=$(cut   -d: -f2- <<< "$line")
-        cpuser=$(awk  -F'==' '{print $1}' <<< "$rest" | tr -d ' \t')
-        parent=$(awk  -F'==' '{print $2}' <<< "$rest" | tr -d ' \t')
-        dtype=$(awk   -F'==' '{print $3}' <<< "$rest" | tr -d ' \t')
-        docroot=$(awk -F'==' '{print $4}' <<< "$rest" | tr -d ' \t')
-        [[ -z "$domain" || -z "$cpuser" ]] && continue
-        [[ -n "$docroot" ]] && G_DOMAIN_DOCROOT["$domain"]="$docroot"
-        if [[ "$dtype" == "parked" || "$dtype" == "alias" ]]; then
-            [[ -n "$parent" ]] && G_PARKED_PARENT["$domain"]="$parent"
+
+    while IFS=$'\t' read -r _dom _dtype _parent _docroot; do
+        [[ -z "$_dom" ]] && continue
+        [[ -n "$_docroot" ]] && G_DOMAIN_DOCROOT["$_dom"]="$_docroot"
+        if [[ "$_dtype" == "parked" || "$_dtype" == "alias" ]]; then
+            [[ -n "$_parent" ]] && G_PARKED_PARENT["$_dom"]="$_parent"
         fi
-    done < /etc/userdatadomains
+    done < <(awk '
+        /^#/ { next }
+        {
+            # format: domain: cpuser==parent==type==docroot
+            colon = index($0, ": ")
+            if (!colon) next
+            domain = substr($0, 1, colon-1)
+            rest   = substr($0, colon+2)
+            n = split(rest, a, "==")
+            # a[1]=cpuser, a[2]=parent, a[3]=type, a[4]=docroot
+            gsub(/ /, "", domain)
+            printf "%s\t%s\t%s\t%s\n",
+                domain,
+                (n>=3 ? a[3] : ""),
+                (n>=2 ? a[2] : ""),
+                (n>=4 ? a[4] : "")
+        }
+    ' /etc/userdatadomains)
 }
 
 ###############################################################################
@@ -140,44 +150,53 @@ get_all_cpanel_users() {
     local -n _out=$1
     _out=()
     local -A _seen=()
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" ]] && continue
-        local u
-        u=$(awk '{print $2}' <<< "$line" | tr -d ' \t')
-        [[ -z "$u" ]] && continue
-        [[ -z "${_seen[$u]+x}" ]] && _seen["$u"]=1 && _out+=("$u")
+    while IFS=': ' read -r _ cpuser _; do
+        [[ -z "$cpuser" ]] && continue
+        [[ -z "${_seen[$cpuser]+x}" ]] && _seen["$cpuser"]=1 && _out+=("$cpuser")
     done < /etc/trueuserdomains
     mapfile -t _out < <(printf '%s\n' "${_out[@]}" | sort)
 }
 
 ###############################################################################
 # Build: Addon Domains Map (/etc/userdomains)
+# ใช้ awk single pass — bash while loop ช้ามากกับ 12,952+ lines
 # กรองออก: .cp, nobody, *, main domains, cPanel internal subdomains, parked/alias
 ###############################################################################
 build_addon_domains_map() {
     local filter_users=("$@")
     G_ADDON_DOMAINS=()
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" ]] && continue
-        [[ "$line" == *".cp:"*   ]] && continue
-        [[ "$line" == *"nobody"* ]] && continue
-        [[ "$line" == \**        ]] && continue
-        local domain cpuser
-        domain=$(awk '{print $1}' <<< "$line" | tr -d ':' | tr -d ' \t')
-        cpuser=$(awk '{print $2}' <<< "$line" | tr -d ' \t')
-        [[ -z "$domain" || -z "$cpuser" ]] && continue
-        [[ "$domain" =~ ^(mail|ftp|cpanel|webmail|whm|cpcalendars|cpcontacts|autodiscover|www)\. ]] && continue
-        [[ -n "${G_MAIN_DOMAINS[$domain]+x}" ]]  && continue
-        [[ -n "${G_PARKED_PARENT[$domain]+x}" ]] && continue
-        local main_dom="${G_USER_MAINDOMAIN[$cpuser]:-}"
-        [[ -n "$main_dom" && "$domain" == *".$main_dom" ]] && continue
-        if [[ ${#filter_users[@]} -gt 0 ]]; then
-            local match=0
-            for u in "${filter_users[@]}"; do [[ "$cpuser" == "$u" ]] && match=1 && break; done
-            [[ $match -eq 0 ]] && continue
-        fi
-        G_ADDON_DOMAINS["$domain"]="$cpuser"
-    done < /etc/userdomains
+
+    # สร้าง filter pattern สำหรับ awk
+    local _filter_pat=""
+    if [[ ${#filter_users[@]} -gt 0 ]]; then
+        _filter_pat=$(printf '%s\n' "${filter_users[@]}" | awk '{printf "|"$0}' | cut -c2-)
+    fi
+
+    while IFS=$'\t' read -r _dom _cpu; do
+        [[ -z "$_dom" || -z "$_cpu" ]] && continue
+        [[ -n "${G_MAIN_DOMAINS[$_dom]+x}" ]]  && continue
+        [[ -n "${G_PARKED_PARENT[$_dom]+x}" ]] && continue
+        local _main="${G_USER_MAINDOMAIN[$_cpu]:-}"
+        [[ -n "$_main" && "$_dom" == *".$_main" ]] && continue
+        G_ADDON_DOMAINS["$_dom"]="$_cpu"
+    done < <(awk -v filter="$_filter_pat" '
+        /^#/           { next }
+        /\.cp:/        { next }
+        /nobody/       { next }
+        /^\*/          { next }
+        /^(mail|ftp|cpanel|webmail|whm|cpcalendars|cpcontacts|autodiscover|www)\./ { next }
+        {
+            colon = index($0, ":")
+            if (!colon) next
+            domain = substr($0, 1, colon-1)
+            cpuser = substr($0, colon+2)
+            gsub(/[ \t]/, "", domain)
+            gsub(/[ \t]/, "", cpuser)
+            if (!domain || !cpuser) next
+            if (filter != "" && cpuser !~ ("^("filter")$")) next
+            printf "%s\t%s\n", domain, cpuser
+        }
+    ' /etc/userdomains)
 }
 
 ###############################################################################
@@ -357,10 +376,8 @@ echo ""
 printf "กรุณาเลือก [1-2]: "
 read -r MODE
 
-# ── Build maps ───────────────────────────────────────────────────────────
-build_main_domains_map
-build_parked_alias_map
-
+# get_all_cpanel_users อ่านแค่ /etc/trueuserdomains (39 lines) — instant
+# ไม่ต้อง build maps ก่อน → user list แสดงทันที
 declare -a ALL_CPANEL_USERS=()
 get_all_cpanel_users ALL_CPANEL_USERS
 
@@ -378,7 +395,22 @@ case "$MODE" in
         printf "${YELLOW}ยืนยันการอัพเดตทุก cPanel? [y/N]: ${NC}"
         read -r CONFIRM
         [[ "${CONFIRM,,}" != "y" ]] && echo -e "${RED}ยกเลิก${NC}" && exit 0
+
+        # Build maps หลัง confirm — spinner ขณะโหลด
+        printf "\r  ${CYAN}⟳  กำลังโหลด domain map...${NC} "
+        (
+            _sp='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'; _si=0
+            while true; do
+                _si=$(( (_si+1) % 10 ))
+                printf "\r  ${CYAN}⟳  กำลังโหลด domain map...${NC}  ${YELLOW}%s${NC}" "${_sp:$_si:1}"
+                sleep 0.1
+            done
+        ) &
+        _MAP_SPINNER=$!; disown "$_MAP_SPINNER"
+        build_main_domains_map
+        build_parked_alias_map
         build_addon_domains_map
+        kill "$_MAP_SPINNER" 2>/dev/null; printf "\r\033[K"
         ;;
 
     # ──────────────────────────────────────────────────────────────────────
@@ -425,7 +457,21 @@ case "$MODE" in
         printf "${YELLOW}ยืนยัน? [y/N]: ${NC}"
         read -r CONFIRM2
         [[ "${CONFIRM2,,}" != "y" ]] && echo -e "${RED}ยกเลิก${NC}" && exit 0
+
+        # Build maps หลัง confirm — spinner ขณะโหลด
+        (
+            _sp='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'; _si=0
+            while true; do
+                _si=$(( (_si+1) % 10 ))
+                printf "\r  ${CYAN}⟳  กำลังโหลด domain map...${NC}  ${YELLOW}%s${NC}" "${_sp:$_si:1}"
+                sleep 0.1
+            done
+        ) &
+        _MAP_SPINNER=$!; disown "$_MAP_SPINNER"
+        build_main_domains_map
+        build_parked_alias_map
         build_addon_domains_map "${SELECTED_USERS[@]}"
+        kill "$_MAP_SPINNER" 2>/dev/null; printf "\r\033[K"
         ;;
 
     *)
