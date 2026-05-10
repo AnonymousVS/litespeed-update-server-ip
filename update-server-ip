@@ -2,11 +2,15 @@
 ###############################################################################
 # update-server-ip.sh
 # LiteSpeed Cache — Update Server IP across cPanel accounts
-# Version : 2.0.0
+# Version : 2.1.0
 # Location: /usr/local/sbin/update-server-ip.sh
 # Usage   : bash /usr/local/sbin/update-server-ip.sh
 # ─────────────────────────────────────────────────────────────────────────────
 # CHANGELOG:
+#   v2.1.0 | 2026-04-29 | ลบ getent passwd (cPanel user ไม่อยู่ใน /etc/passwd)
+#           |            | ลบ whmapi1 fallback (~0.5-2s/domain → ค้างนาน)
+#           |            | ใช้ /home/USER โดยตรง, path ไม่เจอ = SKIP ทันที
+#           |            | เพิ่ม spinner ขณะ SCAN
 #   v2.0.0 | 2026-04-29 | เพิ่ม Mode 1/2 menu เลือก cPanel
 #           |            | รองรับ 2 path structures
 #           |            | กรอง domain ครบ (trueuserdomains+userdatadomains)
@@ -14,7 +18,7 @@
 #   v1.0.0 | 2026-04-01 | Initial release
 ###############################################################################
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # ── Config ──────────────────────────────────────────────────────────────────
 RAM_PER_JOB_MB=200
